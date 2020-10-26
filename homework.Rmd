@@ -1,0 +1,559 @@
+---
+title: "single cell RNA-seq"
+author: "Cenk Celik"
+date: "14/09/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Analysis of Individual Datasets
+
+I will be analyzing two datasets: Hodgkin Lymphoma whole genome from a 19-year old male and Peripheral Blood Mononuclear Cells (PBMC) whole genome from a 25-year-old healthy female available at [10X Genomics](https://support.10xgenomics.com/single-cell-gene-expression/datasets).
+
+> For Hodgkin:
+
+* Sequencing Depth: 78,314 reads per cell
+* Paired-end (28 x 91)
+
+> For PBMC:
+
+* Sequencing Depth: 69,859 reads per cell
+* Paired-end (28 X 91)
+
+Since storage and computing speed limitations of my personal computer, I skipped alignment step. However, I could have done alignment using HISAT2, followed by quality assessment using FastQC on [Galaxy Main](https://usegalaxy.org). Instead, I used feature matrices due to insufficient storage on my personal computer. Here are the links to the feature matrices of both Hodgkin's Lymphoma and PBMC datasets:
+
+* [Hodgkin Lymphoma](https://support.10xgenomics.com/single-cell-gene-expression/datasets/4.0.0/Parent_NGSC3_DI_HodgkinsLymphoma)
+* [PBMC](https://support.10xgenomics.com/single-cell-gene-expression/datasets/4.0.0/Parent_NGSC3_DI_PBMC)
+
+I will start the analysis by first reading the data as in Seurat Objects, followed by standard pre-processing that includes QC and _Log Normalisation_. I will then detect variable genes, scale data, reduce dimension (both linear and non-linear), determine significant PCAs, cluster the cells and find differentially-expressed genes.
+
+## Read and Pre-process Datasets
+
+I start with loading required packages and those that may be necessary.
+
+```{r message=FALSE, warning=FALSE}
+# load packages
+library(Seurat)
+library(cowplot)
+library(dplyr)
+library(tidyverse)
+library(Matrix)
+```
+
+## Load the feature matrices of Hodgkin and PBMC:
+
+* Hodgkin Lymphoma Feature Matrix ([filtered](https://cf.10xgenomics.com/samples/cell-exp/4.0.0/Parent_NGSC3_DI_HodgkinsLymphoma/Parent_NGSC3_DI_HodgkinsLymphoma_filtered_feature_bc_matrix.tar.gz))
+* PBMC Feature Matrix ([filtered](https://cf.10xgenomics.com/samples/cell-exp/4.0.0/Parent_NGSC3_DI_PBMC/Parent_NGSC3_DI_PBMC_filtered_feature_bc_matrix.tar.gz))
+
+```{r}
+# load datasets
+hodgkin.data <- Read10X(data.dir = "counts/Parent_NGSC3_DI_HodgkinsLymphoma_filtered_feature_bc_matrix/",
+                   gene.column = 2,
+                   unique.features = TRUE,
+                   strip.suffix = FALSE)
+pbmc.data <- Read10X(data.dir = "counts/Parent_NGSC3_DI_PBMC_filtered_feature_bc_matrix",
+                gene.column = 2,
+                unique.features = TRUE,
+                strip.suffix = FALSE)
+```
+
+## Initialise Seurat Objects with non-normalised data
+
+* Genes expressed in more than 3 cells (corresponds to approx. 0.1% of the data)
+* Cells with at least 200 detected genes
+
+```{r}
+hodgkin <- CreateSeuratObject(counts = hodgkin.data,
+                              min.cells = 3,
+                              min.features = 200,
+                              project = "10X_Hodgkin",
+                              assay = "RNA")
+pbmc <- CreateSeuratObject(counts = pbmc.data,
+                              min.cells = 3,
+                              min.features = 200,
+                              project = "10X_PBMC",
+                              assay = "RNA")
+```
+
+## QC and Cell Selection
+
+To further filter out cells based on technical and biological parameters, I will have a look at the current data, then clear outliers and potential multiplets. I will also filter cells based on the mitochondrial gene percentage.
+
+* Selection of mitochondrial genes:
+
+```{r}
+mito.hodgkin <- grep(pattern = "^MT-",
+                     x = rownames(hodgkin@assays[["RNA"]]),
+                     value = TRUE)
+mito.pbmc <- grep(pattern = "^MT-",
+                     x = rownames(pbmc@assays[["RNA"]]),
+                     value = TRUE)
+```
+
+```{r}
+percent.hodgkin <- Matrix::colSums(hodgkin@assays[["RNA"]][mito.hodgkin, ])/Matrix::colSums(hodgkin@assays[["RNA"]])
+percent.pbmc <- Matrix::colSums(pbmc@assays[["RNA"]][mito.pbmc, ])/Matrix::colSums(pbmc@assays[["RNA"]])
+```
+
+## Add metadata to mitochondrial genes:
+
+```{r}
+hodgkin$percent.mito <- percent.hodgkin
+pbmc$percent.mito <- percent.pbmc
+```
+
+## Visualisation by Violin plots:
+
+```{r}
+VlnPlot(object = hodgkin, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), ncol = 3)
+VlnPlot(object = pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), ncol = 3)
+```
+
+## Gene Plots:
+
+```{r}
+FeatureScatter(object = hodgkin, feature1 = "nCount_RNA", feature2 = "percent.mito")
+FeatureScatter(object = pbmc, feature1 = "nCount_RNA", feature2 = "percent.mito")
+```
+
+```{r}
+FeatureScatter(object = hodgkin, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+FeatureScatter(object = pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+```
+
+Since there is a rare subset of cells with an outlier level of high mitochondrial percentage and also low UMI content, I will filter out cells that have unique gene counts over 2500 or less than 200:
+
+```{r}
+hodgkin <- subset(x = hodgkin, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mito >  -Inf & percent.mito < 0.05 )
+pbmc <- subset(x = pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mito >  -Inf & percent.mito < 0.05 )
+```
+
+## Normalise the data
+
+Having removed unwanted cells from the datasets, I will apply "LogNormalize" method that normalises the gene expression for each cell by total expression, multiplied by 10000 scaling factor.
+
+```{r}
+hodgkinNorm <- NormalizeData(object = hodgkin,
+                         normalization.method = "LogNormalize",
+                         scale.factor = 10000)
+pbmcNorm <- NormalizeData(object = pbmc,
+                         normalization.method = "LogNormalize",
+                         scale.factor = 10000)
+```
+
+## Detection of variable genes
+
+I will now use FindVariableGenes that calculates the average expression and dispersion for each gene, places these genes into bins, and then calculates a z-score for dispersion within each bin. This helps control for the relationship between variability and average expression. Here, I identify ~2,000 variable genes, and represent typical parameter settings for UMI data that is normalized to a total of 1e4 molecules.
+
+```{r}
+hodgkin <- FindVariableFeatures(object = hodgkinNorm,
+                                mean.function = ExpMean,
+                                dispersion.function = LogVMR,
+                                nfeatures = 2000)
+pbmc <- FindVariableFeatures(object = pbmcNorm,
+                                mean.function = ExpMean,
+                                dispersion.function = LogVMR,
+                                nfeatures = 2000)
+```
+
+Let's have a look at the output:
+
+```{r}
+head(x = HVFInfo(object = hodgkin))
+head(x = HVFInfo(object = pbmc))
+```
+
+## Scaling Data and Removing Unwanted Variation Sources
+
+The datasets may contain technical noise, batch effects, or biological sources of variation. To improve downstream dimension reduction and clustering, I will regress these signals out of the analysis.
+
+```{r}
+hodgkin <- ScaleData(object = hodgkin,
+                     vars.to.regress = c("nCount_RNA", "percent.mito"))
+pbmc <- ScaleData(object = pbmc,
+                     vars.to.regress = c("nCount_RNA", "percent.mito"))
+```
+
+## Linear Dimension Reduction
+
+```{r}
+hodgkin <- RunPCA(object = hodgkin,
+                  npcs = 30,
+                  verbose = FALSE)
+pbmc <- RunPCA(object = pbmc,
+                  npcs = 30,
+                  verbose = FALSE)
+```
+
+## Visualise PCAs
+
+I will have a look at an arbitrary feature, say kappa light chain (IGKC).
+
+```{r}
+DimPlot(object = hodgkin, reduction = "pca")
+DimPlot(object = pbmc, reduction = "pca")
+FeaturePlot(object = hodgkin, features = "IGKC")
+FeaturePlot(object = pbmc, features = "IGKC")
+```
+
+## Dimensional Reduction Plot with Coloured Cells by a Feature
+
+```{r}
+FeatureScatter(object = hodgkin, feature1 = "IGKC", feature2 = "PC_1")
+FeatureScatter(object = pbmc, feature1 = "IGKC", feature2 = "PC_1")
+```
+
+```{r}
+VariableFeaturePlot(object = hodgkin)
+VariableFeaturePlot(object = pbmc)
+```
+
+Let's have a look at some arbitrary (well, not completely) features:
+
+```{r}
+VlnPlot(object = hodgkin, features = c("ICOS", "IL7R", "GZMK"))
+VlnPlot(object = pbmc, features = c("ICOS", "IL7R", "GZMK"))
+RidgePlot(object = hodgkin, feature = c("ICOS", "IL7R", "GZMK"))
+RidgePlot(object = pbmc, feature = c("ICOS", "IL7R", "GZMK"))
+```
+
+## Heatmaps
+
+For easy exploration of the primary sources of heterogeneity in a dataset, I plotted heatmaps to decide which PCs to include for further downstream analyses. Cells and genes are ordered according to their PCA scores.
+
+```{r}
+DimHeatmap(object = hodgkin, reduction = "pca", cells = 200, balanced = TRUE, fast = FALSE) +
+  ggplot2::scale_fill_gradientn(colors = c("steelblue1", "white", "tomato"))
+DimHeatmap(object = pbmc, reduction = "pca", cells = 200, balanced = TRUE, fast = FALSE) +
+  ggplot2::scale_fill_gradientn(colors = c("steelblue1", "white", "tomato"))
+```
+
+## Statistically significant PCA
+
+I, then, identified significant PCs as those that have a strong enrichment of low _p-value_ genes.
+
+```{r}
+hodgkin <- JackStraw(object = hodgkin, reduction = "pca", dims =30, num.replicate = 100,  prop.freq = 0.1, verbose = FALSE)
+pbmc <- JackStraw(object = pbmc, reduction = "pca", dims = 30, num.replicate = 100,  prop.freq = 0.1, verbose = FALSE)
+```
+
+```{r}
+hodgkin <- ScoreJackStraw(object = hodgkin, dims = 1:30, reduction = "pca")
+pbmc <- ScoreJackStraw(object = pbmc, dims = 1:30, reduction = "pca")
+
+JackStrawPlot(object = hodgkin, dims = 1:30, reduction = "pca")
+JackStrawPlot(object = pbmc, dims = 1:30, reduction = "pca")
+```
+
+For Hodgkin dataset, PCs from 1-13 seem significant, except PC 10. However, for PBMC, all PCs, except for PC  19, 22, 27 and 30, are statistically significant ( _p_ < 0.05).
+
+## Cut-off Point
+
+To further determine which PCs to use is to look at a plot of the standard deviations of the principle components and draw the cutoff where there is a clear elbow in the graph. In these datasets, it looks like the elbows for both groups fall around PC 5.
+
+```{r}
+ElbowPlot(object = hodgkin)
+ElbowPlot(object = pbmc)
+```
+
+## Clustering the Cells
+
+First, I will calculate _k-nearest neighbors_, then construct the SNN graph.
+
+```{r}
+hodgkin <- FindNeighbors(hodgkin, reduction = "pca", dims = 1:30)
+pbmc <- FindNeighbors(pbmc, reduction = "pca", dims = 1:30)
+```
+
+Now, I will FindClusters
+
+```{r}
+hodgkin <- FindClusters(hodgkin, resolution = 0.5, algorithm = 1)
+pbmc <- FindClusters(pbmc, resolution = 0.5, algorithm = 1)
+```
+
+## Non-linear Dimensional Reduction (tSNE)
+
+```{r}
+hodgkin <- RunTSNE(object = hodgkin, dims.use = 1:10, do.fast = TRUE, do.label = T)
+DimPlot(object = hodgkin, reduction = "tsne")
+
+pbmc <- RunTSNE(object = pbmc, dims.use = 1:10, do.fast = TRUE, do.label = T)
+DimPlot(object = pbmc, reduction = "tsne")
+```
+
+## UMAP
+
+```{r}
+hodgkin <- RunUMAP(hodgkin, reduction = "pca", dims = 1:30)
+DimPlot(hodgkin, reduction = "umap", split.by = "seurat_clusters")
+
+pbmc <- RunUMAP(pbmc, reduction = "pca", dims = 1:30)
+DimPlot(pbmc, reduction = "umap", split.by = "seurat_clusters")
+```
+
+Save as RDS:
+
+```{r}
+saveRDS(hodgkin, file = "hodgkin.rds")
+saveRDS(pbmc, file = "pbmc.rds")
+```
+
+## Differentially expressed genes
+
+I will find all markers distinguishing cluster 0 from other clusters
+
+```{r}
+cluster0.hodgkin <- FindMarkers(object = hodgkin, ident.1 = 0, ident.2 = c(1, 2, 3, 4, 5, 6), min.pct = 0.25)
+print(x = head(x = cluster0.hodgkin, n = 5))
+
+cluster0.pbmc <- FindMarkers(object = pbmc, ident.1 = 0, ident.2 = c(1, 2, 3, 4, 5, 6), min.pct = 0.25)
+print(x = head(x = cluster0.pbmc, n = 5))
+```
+
+Now, I will find all positive markers for every cluster compared to all remaining cells.
+
+```{r}
+hodgkin.markers <- FindAllMarkers(object = hodgkin, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25)
+pbmc.markers <- FindAllMarkers(object = pbmc, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25)
+```
+
+Further piping to filter:
+
+```{r}
+hodgkin.markers %>% group_by(cluster) %>% top_n(2, avg_logFC)
+pbmc.markers %>% group_by(cluster) %>% top_n(2, avg_logFC)
+```
+
+Here, I visualised some arbitrarily-selected, differentially-expressed genes at different clusters. 
+```{r}
+VlnPlot(object = hodgkin, features = c("MS4A1", "IL7R", "NKG7"))
+VlnPlot(object = pbmc, features = c("MS4A1", "IL7R", "NKG7"))
+```
+
+```{r}
+FeaturePlot(object = hodgkin, features = c("PGM2L1", "DUSP4", "CD55", "STMN1", "MS4A1"), cols = c("grey", "blue"), reduction = "tsne")
+FeaturePlot(object = pbmc, features = c("PGM2L1", "DUSP4", "CD55", "STMN1", "MS4A1"), cols = c("grey", "blue"), reduction = "tsne")
+```
+
+```{r heatmap1, fig.height = 20, fig.width = 20, fig.align = "center"}
+top10_h <- hodgkin.markers %>% group_by(cluster) %>% top_n(10, avg_logFC)
+DoHeatmap(object = hodgkin, features = top10_h$gene, label = TRUE) +
+  ggplot2::scale_fill_gradientn(colors = c("steelblue1", "white", "tomato"))
+
+top10_p <- pbmc.markers %>% group_by(cluster) %>% top_n(10, avg_logFC)
+DoHeatmap(object = pbmc, features = top10_p$gene, label = TRUE) +
+  ggplot2::scale_fill_gradientn(colors = c("steelblue1", "white", "tomato"))
+```
+
+## Assign Cell Types Identity to Clusters
+
+```{r}
+current.cluster.ids <- c(0, 1, 2, 3, 4, 5, 6)
+new.cluster.ids <- c("CD4 T cells", "CD14+ Monocytes", "B cells", "CD8 T cells", "FCGR3A+ Monocytes", "NK cells", "Dendritic cells")
+
+hodgkin@active.ident <- plyr::mapvalues(x = hodgkin@active.ident, from = current.cluster.ids, to = new.cluster.ids)
+DimPlot(object = hodgkin, reduction = "tsne", label = TRUE, pt.size = 0.5)
+
+pbmc@active.ident <- plyr::mapvalues(x = pbmc@active.ident, from = current.cluster.ids, to = new.cluster.ids)
+DimPlot(object = pbmc, reduction = "tsne", label = TRUE, pt.size = 0.5)
+```
+
+# Anaylsis of Combined Datasets
+
+I will combine datasets for Hodgkin with Targeted, and PBMC with Targeted datasets, followed by UMAPs and differential expression analysis within the pair for each sample types.
+
+```{r}
+hodgkin.data <- Read10X(data.dir = "counts/Parent_NGSC3_DI_HodgkinsLymphoma_filtered_feature_bc_matrix/")
+targetedHodgkin.data <- Read10X(data.dir = "counts/Targeted_NGSC3_DI_HodgkinsLymphoma_GeneSignature_filtered_feature_bc_matrix")
+pbmc.data <- Read10X(data.dir = "counts/Parent_NGSC3_DI_PBMC_filtered_feature_bc_matrix")
+targetedPbmc.data <- Read10X(data.dir = "counts/Targeted_NGSC3_DI_PBMC_Immunology_filtered_feature_bc_matrix")
+```
+
+## Combined datasets
+
+I have tried combining raw datasets, however, each trial was aborted because of memory shortage. So, I tried combining normalised/scaled data. Since aforementioned steps are described in detail, I will fast-forward to normalisation in a single chunk, and try to combine those datasets.
+
+```{r}
+hodgkin <- CreateSeuratObject(counts = hodgkin.data,
+                              min.cells = 3,
+                              min.features = 200,
+                              project = "10X_Hodgkin",
+                              assay = "RNA")
+targetedHodgkin <- CreateSeuratObject(counts = targetedHodgkin.data,
+                              min.cells = 3,
+                              min.features = 200,
+                              project = "10X_HodgkinTargeted",
+                              assay = "RNA")
+pbmc <- CreateSeuratObject(counts = pbmc.data,
+                              min.cells = 3,
+                              min.features = 200,
+                              project = "10X_PBMC",
+                              assay = "RNA")
+targetedPbmc <- CreateSeuratObject(counts = targetedPbmc.data,
+                              min.cells = 3,
+                              min.features = 200,
+                              project = "10X_PBMCTargeted",
+                              assay = "RNA")
+
+mito.hodgkin <- grep(pattern = "^MT-",
+                     x = rownames(hodgkin@assays[["RNA"]]),
+                     value = TRUE)
+mito.pbmc <- grep(pattern = "^MT-",
+                     x = rownames(pbmc@assays[["RNA"]]),
+                     value = TRUE)
+mito.targetedHodgkin <- grep(pattern = "^MT-",
+                     x = rownames(targetedHodgkin@assays[["RNA"]]),
+                     value = TRUE)
+mito.targetedPbmc <- grep(pattern = "^MT-",
+                     x = rownames(targetedPbmc@assays[["RNA"]]),
+                     value = TRUE)
+
+percent.hodgkin <- Matrix::colSums(hodgkin@assays[["RNA"]][mito.hodgkin, ])/Matrix::colSums(hodgkin@assays[["RNA"]])
+percent.targetedHodgkin <- Matrix::colSums(targetedHodgkin@assays[["RNA"]][mito.targetedHodgkin, ])/Matrix::colSums(targetedHodgkin@assays[["RNA"]])
+percent.pbmc <- Matrix::colSums(pbmc@assays[["RNA"]][mito.pbmc, ])/Matrix::colSums(pbmc@assays[["RNA"]])
+percent.targetedPbmc <- Matrix::colSums(targetedPbmc@assays[["RNA"]][mito.targetedPbmc, ])/Matrix::colSums(targetedPbmc@assays[["RNA"]])
+
+hodgkin$percent.mito <- percent.hodgkin
+targetedHodgkin$percent.mito <- percent.targetedHodgkin
+pbmc$percent.mito <- percent.pbmc
+targetedPbmc$percent.mito <- percent.targetedPbmc
+
+hodgkin <- subset(x = hodgkin, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mito >  -Inf & percent.mito < 0.05 )
+targetedHodgkin <- subset(x = targetedHodgkin, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mito >  -Inf & percent.mito < 0.05 )
+pbmc <- subset(x = pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mito >  -Inf & percent.mito < 0.05 )
+targetedPbmc <- subset(x = targetedPbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mito >  -Inf & percent.mito < 0.05 )
+
+hodgkinNorm <- NormalizeData(object = hodgkin,
+                         normalization.method = "LogNormalize",
+                         scale.factor = 10000)
+targetedHodgkinNorm <- NormalizeData(object = targetedHodgkin,
+                         normalization.method = "LogNormalize",
+                         scale.factor = 10000)
+pbmcNorm <- NormalizeData(object = pbmc,
+                         normalization.method = "LogNormalize",
+                         scale.factor = 10000)
+targetedPbmcNorm <- NormalizeData(object = targetedPbmc,
+                         normalization.method = "LogNormalize",
+                         scale.factor = 10000)
+```
+
+```{r}
+hodgkin.merged <- merge(x = hodgkinNorm, y = targetedHodgkinNorm, add.cell.ids = c("Hodgkin", "Targeted"), merge.data = TRUE, project = "10X_Hodgkin")
+pbmc.merged <- merge(x = pbmcNorm, y = targetedPbmcNorm, add.cell.ids = c("PBMC", "Targeted"), merge.data = TRUE, project = "10X_PBMC")
+```
+
+Let's have a look datasets:
+
+```{r}
+table(hodgkin.merged$orig.ident)
+table(pbmc.merged$orig.ident)
+GetAssayData(hodgkin.merged)[1:10, 1:15]
+GetAssayData(pbmc.merged)[1:10, 1:15]
+```
+
+## UMAPs
+
+```{r}
+hodgkin <- FindVariableFeatures(object = hodgkin.merged,
+                                mean.function = ExpMean,
+                                dispersion.function = LogVMR,
+                                nfeatures = 2000)
+pbmc <- FindVariableFeatures(object = pbmc.merged,
+                                mean.function = ExpMean,
+                                dispersion.function = LogVMR,
+                                nfeatures = 2000)
+
+hodgkin <- ScaleData(object = hodgkin,
+                     vars.to.regress = c("nCount_RNA", "percent.mito"))
+pbmc <- ScaleData(object = pbmc,
+                     vars.to.regress = c("nCount_RNA", "percent.mito"))
+
+hodgkin <- RunPCA(object = hodgkin,
+                  verbose = FALSE)
+pbmc <- RunPCA(object = pbmc,
+                  verbose = FALSE)
+```
+
+UMAP plots:
+
+```{r}
+hodgkin <- RunUMAP(hodgkin, reduction.key = "UMAP_", dims = 1:20)
+hodgkin <- FindNeighbors(hodgkin, dims = 1:20, verbose = FALSE)
+hodgkin <- FindClusters(hodgkin, verbose = FALSE)
+UMAPPlot(hodgkin, split.by = "orig.ident", label = TRUE) + NoLegend()
+
+pbmc <- RunUMAP(pbmc, reduction.key = "UMAP_", dims = 1:20)
+pbmc <- FindNeighbors(pbmc, dims = 1:20, verbose = FALSE)
+pbmc <- FindClusters(pbmc, verbose = FALSE)
+UMAPPlot(pbmc, split.by = "orig.ident", label = TRUE) + NoLegend()
+```
+
+## Differentially expressed genes
+
+```{r}
+hodgkin.markers <- FindAllMarkers(object = hodgkin,
+                                  only.pos = FALSE,
+                                  min.pct = 0.25,
+                                  thresh.use = 0.25,
+                                  test.use = "wilcox")
+pbmc.markers <- FindAllMarkers(object = hodgkin,
+                               only.pos = FALSE,
+                               min.pct = 0.25,
+                               thresh.use = 0.25,
+                               test.use = "wilcox")
+```
+
+Feature plots of selected genes:
+
+```{r featureplots1, fig.height = 20, fig.width = 20, fig.align = "center"}
+FeaturePlot(object = hodgkin,
+            features = c("PGM2L1", "DUSP4", "CD55", "STMN1", "MS4A1"), 
+            cols = c("grey", "blue"),
+            reduction = "umap",
+            min.cutoff = "q10",
+            max.cutoff = "q90",
+            split.by = "orig.ident",
+            label = TRUE)
+
+FeaturePlot(object = pbmc,
+            features = c("PGM2L1", "DUSP4", "CD55", "STMN1", "MS4A1"), 
+            cols = c("grey", "blue"),
+            reduction = "umap",
+            min.cutoff = "q10",
+            max.cutoff = "q90",
+            split.by = "orig.ident",
+            label = TRUE)
+```
+
+Heatmaps:
+
+```{r heatmap2, fig.height = 20, fig.width = 20, fig.align = "center"}
+top10_h <- hodgkin.markers %>% group_by(cluster) %>% top_n(10, avg_logFC)
+DoHeatmap(object = hodgkin, features = top10_h$gene, label = TRUE, group.by = "orig.ident") +
+  ggplot2::scale_fill_gradientn(colors = c("steelblue1", "white", "tomato"))
+
+
+top10_p <- pbmc.markers %>% group_by(cluster) %>% top_n(10, avg_logFC)
+DoHeatmap(object = pbmc, features = top10_p$gene, label = TRUE, group.by = "orig.ident") +
+  ggplot2::scale_fill_gradientn(colors = c("steelblue1", "white", "tomato"))
+```
+
+# Discussion
+
+Here, I have analysed public datasets of Hodgkin's Lymphoma and PBMC both separately and as in combined with their targeted datasets. I have used both linear (PCA) and non-linear dimensional reduction (tSNE and UMAPS) on separate datasets, then UMAPs method on the combined datasets. Besides, I have visualised some features as heatmaps, violin plots, feature plots, etc.
+
+Studies indicate that almost all cancers share a common pathogenic mechanism. Much like Darwinian evolution, cancer cells acquire heritable genetic variation by arrays of random mutation and go through the process of natural selection resulting in phenotypic diversity like differential gene expressions, alterations in cell regulation and control mechanisms, alteration in macromolecular interaction pathways, etc. These two fundamental processes in cancer cells provide them with the capacity to have a proliferative advantage and higher rate of survival than their neighbouring cells resulting in heterogeneous tumour formations. This heterogeneity is found in both intra- and inter-tumour cell populations. Besides, there are non-genetic factors that result in phenotypic diversity, e.g. epigenetic modifications, clinical diagnostic and therapeutic responses. All these factors result in aberrations in various biological processes of cancer cells and make cancer divergent with no direct correspondence between cancer and normal tissues.
+
+The challenge here associated with the analysis of -omics datasets arise from the inherent heterogeneity of the data. Any unsupervised technique is ultimately based on the study of variation between single cells. Methods like PCA for dimensionality reduction or K-means for clustering, are insensitive to features with a low intersample variation. These methods thus cannot be directly employed for comprehensive analysis of concatenated datasets. To address this issue, alternative methods such as multiple-factor analysis could be employed for large datasets (See figure below). To benefit from such datasets for finding structures, unsupervised machine learning architecture could be used for accurate predictions. To draw a more comprehensive view, experimental data on each layer (fig. above; b and c) should be integrated and analysed. Other than multilayer framework, other methods are spectral graph theory and network theory.
+
+![](/Users/cenkcelik/Projects/homework/network.jpg)
+
+
+```{r session info}
+sessionInfo()
+```
+
